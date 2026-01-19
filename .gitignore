@@ -1,3 +1,6 @@
-venv/
+.venv/
 .ipynb_checkpoints/
 KG_OREGANO.webp
+.DS_Store
+.python-version
+.vscode/
