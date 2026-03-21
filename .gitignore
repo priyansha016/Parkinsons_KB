@@ -4,3 +4,4 @@ KG_OREGANO.webp
 .DS_Store
 .python-version
 .vscode/
+.env
