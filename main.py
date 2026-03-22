@@ -10,6 +10,19 @@ from agents.neo4j_loader_agent import write_to_neo4j
 # Load environment variables (Neo4j credentials, etc.)
 load_dotenv()
 
+PROCESSED_LOG = "processed_files.txt"
+
+def is_processed(file_path):
+    if not os.path.exists(PROCESSED_LOG):
+        return False
+    with open(PROCESSED_LOG, "r") as f:
+        processed = f.read().splitlines()
+    return os.path.basename(file_path) in processed
+
+def mark_as_processed(file_path):
+    with open(PROCESSED_LOG, "a") as f:
+        f.write(os.path.basename(file_path) + "\n")
+
 def run_pipeline(pdf_filename):
     """
     Orchestrates the flow of data from a PDF to the Neo4j Graph.
@@ -30,6 +43,9 @@ def run_pipeline(pdf_filename):
     # This uses the credentials from your .env file
     write_to_neo4j(graph_documents)
     print(f"Data is now live in Neo4j.")
+    
+    # 4. Success: Mark this file as processed to skip it next time
+    mark_as_processed(pdf_filename)
 
 if __name__ == "__main__":
     # Specify the path (File or Directory)
@@ -42,6 +58,9 @@ if __name__ == "__main__":
         
         for pdf_file in pdf_files:
             full_path = os.path.join(DATA_PATH, pdf_file)
+            if is_processed(full_path):
+                print(f"⏩ Skipping (already processed): {pdf_file}")
+                continue
             run_pipeline(full_path)
             
     elif os.path.isfile(DATA_PATH):
