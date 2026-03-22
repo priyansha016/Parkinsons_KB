@@ -28,7 +28,7 @@ An advanced Retrieval-Augmented Generation (RAG) system built around a Neo4j Kno
    ```env
    NEO4J_URI=bolt://localhost:7687
    NEO4J_USERNAME=neo4j
-   NEO4J_PASSWORD=your_password
+   NEO4J_PASSWORD=<YOUR_NEO4J_PASSWORD> # Replace with your actual password
    ```
 
 ### Running the Application

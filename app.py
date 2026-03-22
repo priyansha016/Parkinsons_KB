@@ -58,7 +58,7 @@ def get_stats():
 stats = get_stats()
 if stats:
     df = pd.DataFrame(stats)
-    st.sidebar.dataframe(df, hide_index=True, use_container_width=True)
+    st.sidebar.dataframe(df, hide_index=True, width='stretch')
     st.sidebar.info(f"Total Nodes: {df['count'].sum()}")
 else:
     st.sidebar.error("Could not connect to Neo4j.")
