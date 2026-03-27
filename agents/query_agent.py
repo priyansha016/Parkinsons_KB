@@ -196,9 +196,17 @@ class QueryAgent:
             return []
 
     def _synthesize_answer(self, question: str, results: List[Dict[str, Any]]) -> str:
-        """Summarizes results into natural language."""
+        """Summarizes results, or falls back to general knowledge."""
         if not results:
-            return "I couldn't find any information in the Knowledge Graph. Note: The graph current focuses on Clinical Trials, Genes, and Proteins from your papers."
+            prompt = ChatPromptTemplate.from_template("""
+            The local Knowledge Graph did not contain structural data for this query. 
+            However, you are a helpful medical research assistant. Provide a concise, high-quality answer to the user's question using your general medical knowledge.
+            Start your answer by briefly mentioning: "(General Knowledge Fallback)" so the user knows this didn't come from the Neo4j graph.
+            
+            Question: {question}
+            """)
+            chain = prompt | self.llm | StrOutputParser()
+            return chain.invoke({"question": question})
 
         prompt = ChatPromptTemplate.from_template("""
         Synthesize aconcise answer based on the question and database results.
