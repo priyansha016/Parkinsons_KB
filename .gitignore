@@ -5,3 +5,4 @@ KG_OREGANO.webp
 .python-version
 .vscode/
 .env
+__pycache__/

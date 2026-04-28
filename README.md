@@ -43,5 +43,39 @@ An advanced Retrieval-Augmented Generation (RAG) system built around a Neo4j Kno
    uv run python ask.py
    ```
 
+## Loading the Included Knowledge Graph
+
+A pre-built knowledge graph extracted from the original reference papers is included at [`data/parkinsons_kg.cypher`](data/parkinsons_kg.cypher) — **2,509 nodes** and **3,347 relationships** covering genes, proteins, drugs, clinical trials, therapies, and more.
+
+To load it into your own Neo4j instance:
+
+1. Start a fresh Neo4j database (Desktop or Aura).
+2. In **Neo4j Browser**, run:
+   ```
+   :source /absolute/path/to/data/parkinsons_kg.cypher
+   ```
+   Or via `cypher-shell`:
+   ```bash
+   cypher-shell -u neo4j -p <password> < data/parkinsons_kg.cypher
+   ```
+
+That's it — you now have the same starting graph as this project.
+
+## Extending the Graph with Your Own Papers
+
+The ingestion pipeline is designed so anyone can add new scientific papers on top of the included graph:
+
+1. Load the included KG (above).
+2. Drop your own PDFs into a folder.
+3. Edit `DATA_PATH` in [`main.py`](main.py) to point at that folder.
+4. Run:
+   ```bash
+   uv run python main.py
+   ```
+
+The loader uses Neo4j `MERGE` semantics, so existing nodes are extended (not duplicated) when relationships from new papers reference them.
+
+> **⚠️ Caveat: Entity identity.** The schema-aligner uses an LLM to invent node IDs from the text (e.g. it may call alpha-synuclein `"AlphaSynuclein"` in one run and `"Alpha_Synuclein"` in another). Because `MERGE` matches on the exact ID string, the same biological entity may end up as two separate nodes when extracted across different runs. After ingestion, it's worth running a dedup pass — e.g. using `apoc.text.levenshteinSimilarity` — or normalising IDs against a controlled vocabulary (UniProt for proteins, HGNC for genes, DrugBank for drugs).
+
 ## Architecture Notes
 To optimize response times, the Query Agent utilizes a two-step LLM strategy. Initially, a fast JSON-mode LLM call resolves the chat history context and detects if external API enrichment is needed (KEGG, STRING, ClinicalTrials). Afterwards, it generates a Strict Cypher query against a cached graph schema. An aggressive Python rule-based fixer runs post-generation to intercept known LLM hallucinations before execution.

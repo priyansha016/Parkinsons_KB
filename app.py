@@ -86,15 +86,25 @@ if prompt := st.chat_input("What would you like to know?"):
 
     # Generate response
     with st.chat_message("assistant"):
-        with st.spinner("Analyzing graph and researching APIs..."):
-            try:
-                # Pass the chat history so the agent understands follow-up questions
-                response = st.session_state.agent.ask(prompt, chat_history=st.session_state.messages[:-1])
-                st.markdown(response)
-                # Add assistant message to history
-                st.session_state.messages.append({"role": "assistant", "content": response})
-            except Exception as e:
-                st.error(f"An error occurred: {e}")
+        try:
+            history = st.session_state.messages[:-1]
+            with st.spinner("Querying graph..."):
+                stream = st.session_state.agent.ask_stream(prompt, chat_history=history)
+                # Pull the first chunk inside the spinner so the spinner
+                # disappears as soon as synthesis starts streaming.
+                first_chunks = []
+                for chunk in stream:
+                    first_chunks.append(chunk)
+                    break
+
+            def remaining():
+                yield from first_chunks
+                yield from stream
+
+            response = st.write_stream(remaining())
+            st.session_state.messages.append({"role": "assistant", "content": response})
+        except Exception as e:
+            st.error(f"An error occurred: {e}")
 
 # Footer
 st.divider()
