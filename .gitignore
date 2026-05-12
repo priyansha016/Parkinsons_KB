@@ -6,3 +6,4 @@ KG_OREGANO.webp
 .vscode/
 .env
 __pycache__/
+processed_files.txt

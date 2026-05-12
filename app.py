@@ -88,8 +88,9 @@ if prompt := st.chat_input("What would you like to know?"):
     with st.chat_message("assistant"):
         try:
             history = st.session_state.messages[:-1]
+            agent = st.session_state.agent
             with st.spinner("Querying graph..."):
-                stream = st.session_state.agent.ask_stream(prompt, chat_history=history)
+                stream = agent.ask_stream(prompt, chat_history=history)
                 # Pull the first chunk inside the spinner so the spinner
                 # disappears as soon as synthesis starts streaming.
                 first_chunks = []
@@ -103,6 +104,27 @@ if prompt := st.chat_input("What would you like to know?"):
 
             response = st.write_stream(remaining())
             st.session_state.messages.append({"role": "assistant", "content": response})
+
+            # Diagnostics — show what actually ran
+            with st.expander("🔍 Query details"):
+                if agent.last_cypher:
+                    st.markdown("**Cypher executed:**")
+                    st.code(agent.last_cypher, language="cypher")
+                elif agent.last_skip_reason:
+                    st.caption(f"⚡ Cypher skipped — {agent.last_skip_reason}")
+                else:
+                    st.caption("No Cypher was generated.")
+
+                if agent.last_chunks:
+                    st.markdown("**Top semantic matches:**")
+                    for c in agent.last_chunks[:5]:
+                        paper = c.get("paper") or "?"
+                        page = c.get("page")
+                        score = c.get("score", 0.0)
+                        page_str = f" p.{page}" if page else ""
+                        st.markdown(f"- `{paper}`{page_str} — score {score:.3f}")
+                else:
+                    st.caption("No vector matches.")
         except Exception as e:
             st.error(f"An error occurred: {e}")
 

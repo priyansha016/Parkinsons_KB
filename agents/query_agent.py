@@ -7,7 +7,23 @@ from langchain_core.output_parsers import StrOutputParser
 from neo4j import GraphDatabase, basic_auth
 from dotenv import load_dotenv
 
+from agents.embedder_agent import embed_query
+from agents.neo4j_loader_agent import ensure_vector_index, VECTOR_INDEX_NAME
+
 load_dotenv()
+
+# If the top-scoring vector chunk is at least this similar to the question,
+# skip Cypher generation entirely — the passages are good enough and Cypher
+# would just add ~30s of LLM latency without improving the answer.
+# Bumped to 0.85 after observing that with a small chunk corpus, many
+# off-topic questions still score ~0.75-0.80 just by virtue of being the
+# closest match. 0.85 is a stronger signal that the passages truly answer
+# the question.
+VECTOR_CONFIDENCE_THRESHOLD = 0.85
+
+# How many prior turns of conversation to include in the synthesis prompt
+# so the model can interpret follow-up questions in context.
+HISTORY_TURNS_FOR_SYNTHESIS = 3
 
 
 class QueryAgent:
@@ -21,6 +37,19 @@ class QueryAgent:
 
         self.cached_schema: Optional[str] = None
 
+        # Diagnostics from the most recent ask() / ask_stream() call.
+        # The Streamlit UI surfaces these in a "Query details" expander.
+        self.last_cypher: Optional[str] = None
+        self.last_chunks: List[Dict[str, Any]] = []
+        self.last_skip_reason: Optional[str] = None
+
+        # Ensure the chunk vector index exists (idempotent).
+        try:
+            with self.driver.session() as session:
+                ensure_vector_index(session)
+        except Exception as e:
+            print(f"⚠️ Vector index init in QueryAgent: {e}")
+
         # Warm up Ollama in the background so the first user query doesn't
         # pay the model-load cost.
         threading.Thread(target=self._warmup, daemon=True).start()
@@ -30,6 +59,32 @@ class QueryAgent:
             self.llm.invoke("hi")
         except Exception:
             pass
+
+    def _vector_search(self, question: str, k: int = 5) -> List[Dict[str, Any]]:
+        """Embed the question and return top-k semantically similar chunks
+        with their source paper. Empty list if no chunks exist or model fails."""
+        try:
+            vec = embed_query(question)
+        except Exception as e:
+            print(f"⚠️ Question embedding failed: {e}")
+            return []
+
+        try:
+            with self.driver.session() as session:
+                rows = session.run(
+                    f"CALL db.index.vector.queryNodes('{VECTOR_INDEX_NAME}', $k, $vec) "
+                    f"YIELD node, score "
+                    f"OPTIONAL MATCH (node)<-[:HAS_CHUNK]-(p:Paper) "
+                    f"RETURN node.text AS text, node.page AS page, "
+                    f"       p.id AS paper, score "
+                    f"ORDER BY score DESC",
+                    k=k, vec=vec,
+                ).data()
+            return rows
+        except Exception as e:
+            # Most common reason: no Chunk nodes yet (cold start)
+            print(f"⚠️ Vector search returned nothing: {e}")
+            return []
 
     def _get_schema(self) -> str:
         """Labels, relationship types, property keys, and sample values per label."""
@@ -68,15 +123,15 @@ class QueryAgent:
         return self.cached_schema
 
     def _resolve_pronouns(self, question: str, chat_history: List[Dict[str, str]]) -> str:
-        """Rewrite a follow-up question as standalone. Skips the LLM when no
-        history exists or no obvious pronoun is present."""
-        if not chat_history:
-            return question
+        """Rewrite a follow-up as a standalone question, using conversation
+        history. Runs unconditionally when history exists — the previous
+        keyword heuristic ('it', 'they', ...) missed real follow-ups like
+        'on physical level, what are the symptoms', where the context cue
+        is an implicit definite article rather than a pronoun.
 
-        lower_padded = " " + question.lower() + " "
-        pronouns = [" it ", " its ", " they ", " them ", " their ", " this ",
-                    " that ", " these ", " those ", " which "]
-        if not any(p in lower_padded for p in pronouns):
+        The prompt is tuned to return the question verbatim when it's
+        already standalone, so cost on genuinely-fresh questions is bounded."""
+        if not chat_history:
             return question
 
         history_str = "\n".join(
@@ -84,9 +139,14 @@ class QueryAgent:
         )
 
         prompt = ChatPromptTemplate.from_template("""
-Rewrite the follow-up question as a standalone question.
-Resolve any pronouns (it, they, this, that, which) using the conversation history.
-Return ONLY the rewritten question. No preamble.
+Rewrite the follow-up question as a fully standalone question, using the
+conversation history to fill in implicit context (pronouns, definite
+articles like "the symptoms", continuations like "on physical level").
+
+If the question is ALREADY standalone and self-contained, return it
+verbatim with no changes.
+
+Return ONLY the rewritten question. No preamble, no quotes, no commentary.
 
 History:
 {history}
@@ -97,7 +157,10 @@ Standalone question:""")
 
         chain = prompt | self.llm | StrOutputParser()
         try:
-            return chain.invoke({"history": history_str, "question": question}).strip()
+            rewritten = chain.invoke({"history": history_str, "question": question}).strip()
+            # Strip accidental wrappers some models add
+            rewritten = rewritten.strip('"').strip("'").strip()
+            return rewritten or question
         except Exception:
             return question
 
@@ -123,6 +186,9 @@ Rules:
 1. Use ONLY the labels and relationships provided in the Schema.
 2. For clinical trials, ALWAYS use (t:ClinicalTrial)-[:INVESTIGATES]->(d:Drug).
 3. ALWAYS use fuzzy matching: WHERE toLower(n.name) CONTAINS 'term'.
+   Some nodes also have an `aliases` list (canonicalized via UniProt/HGNC/RxNav).
+   To match either, prefer:
+     WHERE toLower(n.name) CONTAINS 'term' OR ANY(a IN coalesce(n.aliases,[]) WHERE toLower(a) CONTAINS 'term')
 4. Prefer terms that resemble the Sample Values shown in the schema.
 5. NEVER guess or hardcode list of drug or gene names. Query the DB to find them.
 6. Keep queries syntactically simple (use a single MATCH clause). DO NOT chain MATCH patterns with OR.
@@ -253,30 +319,165 @@ Corrected Cypher:""")
             return ""
         return self._extract_cypher(raw)
 
-    def _synthesis_chain(self, results: List[Dict[str, Any]]):
-        """Build the prompt+chain used for synthesis. Shared by streaming and
-        non-streaming paths so they stay in sync."""
+    def _lookup_provenance(self, results: List[Dict[str, Any]]
+                           ) -> List[Dict[str, Any]]:
+        """Given Cypher result rows, find which Paper(s) mention the entities
+        that appear in those rows. Used to surface citations during synthesis."""
         if not results:
-            prompt = ChatPromptTemplate.from_template("""
-The local Knowledge Graph did not contain structural data for this query.
-However, you are a helpful medical research assistant. Provide a concise,
-high-quality answer using your general medical knowledge.
-Start your answer by mentioning: "(General Knowledge Fallback)" so the user
-knows this didn't come from the Neo4j graph.
+            return []
 
-Question: {question}
+        # Pull all string-ish values out of result rows as candidate entity names.
+        candidates = set()
+        for row in results:
+            for v in row.values():
+                if isinstance(v, str) and v.strip():
+                    candidates.add(v.strip())
+        if not candidates:
+            return []
+
+        try:
+            with self.driver.session() as session:
+                rows = session.run(
+                    "MATCH (n)-[:MENTIONED_IN]->(:Chunk)<-[:HAS_CHUNK]-(p:Paper) "
+                    "WHERE n.name IN $names OR n.id IN $names "
+                    "WITH p, collect(DISTINCT n.name)[0..3] AS entities "
+                    "RETURN p.id AS paper, entities "
+                    "ORDER BY size(entities) DESC LIMIT 5",
+                    names=list(candidates),
+                ).data()
+            return rows
+        except Exception as e:
+            print(f"⚠️ Provenance lookup failed: {e}")
+            return []
+
+    def _synthesis_chain(self, results: List[Dict[str, Any]],
+                         provenance: List[Dict[str, Any]],
+                         chunks: List[Dict[str, Any]]):
+        """Pick a synthesis prompt based on what retrieval surfaced:
+        graph rows, vector-retrieved passages, both, or neither.
+
+        All prompts include a {history} variable so the synthesizer can
+        interpret follow-up questions in the context of the conversation.
+        When the passages happen to be from a single paper but the question
+        is broader, the history lets the model recognize the drift and
+        either answer broadly from general knowledge or note the limitation
+        explicitly instead of pretending the passages cover the question."""
+        has_results = bool(results)
+        has_chunks = bool(chunks)
+
+        if not has_results and not has_chunks:
+            prompt = ChatPromptTemplate.from_template("""
+Neither the structured Knowledge Graph nor the indexed paper passages
+contained relevant information for this query. You are a helpful medical
+research assistant — answer concisely from general knowledge.
+Start your answer with: "(General Knowledge Fallback)".
+
+Conversation so far:
+{history}
+
+Current question: {question}
+""")
+        elif has_results and has_chunks:
+            prompt = ChatPromptTemplate.from_template("""
+You are answering a question in an ongoing conversation. Use BOTH the
+structured database results AND the relevant paper passages below.
+Prefer specifics from the structured results; use the passages for
+context and quotation.
+
+If the passages drift off-topic from the question (e.g. all from one
+paper but the question is broader), say so plainly and supplement with
+general knowledge rather than forcing an answer from the passages.
+
+Conversation so far:
+{history}
+
+Current question: {question}
+
+Structured Results: {results}
+
+Source Papers (entities → papers): {provenance}
+
+Relevant Passages (semantic match):
+{chunks}
+
+At the end, write a line: "Sources:" followed by the values of the
+`paper` field shown in the passages above (deduplicated, comma-separated).
+DO NOT cite references mentioned inside the passage text itself
+(e.g. "Smith et al. 2023"). Only cite the `paper` field values.
+""")
+        elif has_chunks:
+            prompt = ChatPromptTemplate.from_template("""
+You are answering a question in an ongoing conversation. The structured
+graph returned no direct rows, but the passages below were retrieved
+semantically from the source papers.
+
+If those passages genuinely cover the question, answer grounded in them.
+If they drift off-topic (e.g. all from one paper about a narrower subject
+than the question asks), say so and answer from general knowledge,
+starting with "(General Knowledge — passages did not cover this)".
+
+Conversation so far:
+{history}
+
+Current question: {question}
+
+Relevant Passages:
+{chunks}
+
+If you used the passages, end with a "Sources:" line listing the values
+of the `paper` field (deduplicated, comma-separated). DO NOT cite
+references mentioned inside the passage text itself.
+""")
+        elif provenance:
+            prompt = ChatPromptTemplate.from_template("""
+You are answering a question in an ongoing conversation. Synthesize a
+concise answer based on the database results below.
+
+Conversation so far:
+{history}
+
+Current question: {question}
+
+Results: {results}
+
+Source Papers: {provenance}
+
+End with a "Sources:" line listing the contributing papers.
 """)
         else:
             prompt = ChatPromptTemplate.from_template("""
-Synthesize a concise answer based on the question and database results.
+You are answering a question in an ongoing conversation. Synthesize a
+concise answer based on the database results.
+
+Conversation so far:
+{history}
+
+Current question: {question}
+
 Results: {results}
-Question: {question}
 """)
         return prompt | self.llm | StrOutputParser()
 
-    def _synthesize_answer(self, question: str, results: List[Dict[str, Any]]) -> str:
-        chain = self._synthesis_chain(results)
-        return chain.invoke({"question": question, "results": str(results)})
+    def _format_history(self, chat_history: List[Dict[str, str]]) -> str:
+        """Render the last N turns for inclusion in synthesis prompts."""
+        if not chat_history:
+            return "(no prior turns)"
+        recent = chat_history[-(HISTORY_TURNS_FOR_SYNTHESIS * 2):]
+        return "\n".join(f"{m['role']}: {m['content']}" for m in recent)
+
+    def _synthesize_answer(self, question: str,
+                           results: List[Dict[str, Any]],
+                           chunks: List[Dict[str, Any]],
+                           chat_history: List[Dict[str, str]]) -> str:
+        provenance = self._lookup_provenance(results) if results else []
+        chain = self._synthesis_chain(results, provenance, chunks)
+        return chain.invoke({
+            "question": question,
+            "results": str(results),
+            "provenance": str(provenance),
+            "chunks": str(chunks),
+            "history": self._format_history(chat_history),
+        })
 
     GREETING_REPLY = (
         "Hello! 👋 I am your Parkinson's Knowledge Graph Research Assistant. "
@@ -288,43 +489,70 @@ Question: {question}
                  "help", "how are you", "howdy"}
 
     def _prepare(self, question: str, chat_history: List[Dict[str, str]]
-                 ) -> Tuple[str, List[Dict[str, Any]]]:
-        """Steps 1-3: resolve pronouns, generate Cypher, execute (with repair).
-        Returns (resolved_question, rows)."""
-        resolved_q = self._resolve_pronouns(question, chat_history)
-        schema = self._get_schema()
-        cypher = self._generate_cypher(resolved_q, schema)
+                 ) -> Tuple[str, List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """Resolve pronouns, run vector search, then conditionally generate Cypher.
 
-        rows, error = self._execute_cypher(cypher)
-        if not rows:
-            print("🔧 Attempting one-shot repair...")
-            repaired = self._repair_cypher(resolved_q, schema, cypher, error)
-            if repaired and repaired != cypher:
-                rows, _ = self._execute_cypher(repaired)
-        return resolved_q, rows
+        Cypher generation costs ~30s on local Llama 3. If the top vector chunk
+        is already a strong semantic match, we skip Cypher and let the passages
+        carry the answer. This is the largest single latency win available."""
+        resolved_q = self._resolve_pronouns(question, chat_history)
+
+        # Vector search runs first because it's cheap (~1s) and tells us
+        # whether Cypher is worth the wait.
+        chunks = self._vector_search(resolved_q, k=5)
+        top_score = max((c.get("score", 0.0) for c in chunks), default=0.0)
+        skip_cypher = top_score >= VECTOR_CONFIDENCE_THRESHOLD
+
+        rows: List[Dict[str, Any]] = []
+        cypher_used: Optional[str] = None
+
+        if skip_cypher:
+            self.last_skip_reason = f"Top vector score {top_score:.2f} ≥ {VECTOR_CONFIDENCE_THRESHOLD}"
+            print(f"⚡ Skipping Cypher generation — {self.last_skip_reason}")
+        else:
+            self.last_skip_reason = None
+            schema = self._get_schema()
+            cypher_used = self._generate_cypher(resolved_q, schema)
+            rows, error = self._execute_cypher(cypher_used)
+            if not rows:
+                print("🔧 Attempting one-shot repair...")
+                repaired = self._repair_cypher(resolved_q, schema, cypher_used, error)
+                if repaired and repaired != cypher_used:
+                    rows, _ = self._execute_cypher(repaired)
+                    cypher_used = repaired
+
+        # Store diagnostics for the UI
+        self.last_cypher = cypher_used
+        self.last_chunks = chunks
+        return resolved_q, rows, chunks
 
     def ask(self, question: str, chat_history: List[Dict[str, str]] = None) -> str:
         chat_history = chat_history or []
         if question.strip().lower().rstrip(".?!") in self.GREETINGS:
             return self.GREETING_REPLY
 
-        resolved_q, rows = self._prepare(question, chat_history)
-        return self._synthesize_answer(resolved_q, rows)
+        resolved_q, rows, chunks = self._prepare(question, chat_history)
+        return self._synthesize_answer(resolved_q, rows, chunks, chat_history)
 
     def ask_stream(self, question: str,
                    chat_history: List[Dict[str, str]] = None) -> Iterator[str]:
-        """Same as ask() but yields the synthesis token-by-token. Steps 1-3
-        still run synchronously (the user sees a spinner), then synthesis
-        streams to the UI."""
+        """Same as ask() but yields synthesis token-by-token."""
         chat_history = chat_history or []
         if question.strip().lower().rstrip(".?!") in self.GREETINGS:
             yield self.GREETING_REPLY
             return
 
-        resolved_q, rows = self._prepare(question, chat_history)
-        chain = self._synthesis_chain(rows)
-        for chunk in chain.stream({"question": resolved_q, "results": str(rows)}):
-            yield chunk
+        resolved_q, rows, chunks = self._prepare(question, chat_history)
+        provenance = self._lookup_provenance(rows) if rows else []
+        chain = self._synthesis_chain(rows, provenance, chunks)
+        for stream_chunk in chain.stream({
+            "question": resolved_q,
+            "results": str(rows),
+            "provenance": str(provenance),
+            "chunks": str(chunks),
+            "history": self._format_history(chat_history),
+        }):
+            yield stream_chunk
 
     def close(self):
         self.driver.close()
