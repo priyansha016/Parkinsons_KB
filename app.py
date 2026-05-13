@@ -107,6 +107,14 @@ if prompt := st.chat_input("What would you like to know?"):
 
             # Diagnostics — show what actually ran
             with st.expander("🔍 Query details"):
+                if agent.last_original_q and agent.last_resolved_q and \
+                        agent.last_resolved_q != agent.last_original_q:
+                    st.markdown("**Question rewriting (pronoun resolver):**")
+                    st.markdown(f"> Original: *{agent.last_original_q}*")
+                    st.markdown(f"> Resolved: *{agent.last_resolved_q}*")
+                elif agent.last_original_q:
+                    st.caption(f"Question (unchanged by resolver): *{agent.last_original_q}*")
+
                 if agent.last_cypher:
                     st.markdown("**Cypher executed:**")
                     st.code(agent.last_cypher, language="cypher")

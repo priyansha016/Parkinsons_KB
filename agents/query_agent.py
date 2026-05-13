@@ -28,7 +28,7 @@ HISTORY_TURNS_FOR_SYNTHESIS = 3
 
 class QueryAgent:
     def __init__(self):
-        self.llm = ChatOllama(model="llama3", temperature=0.0)
+        self.llm = ChatOllama(model="gemma3:4b", temperature=0.0)
 
         uri = os.getenv("NEO4J_URI", "bolt://localhost:7687")
         user = os.getenv("NEO4J_USERNAME", "neo4j")
@@ -42,6 +42,8 @@ class QueryAgent:
         self.last_cypher: Optional[str] = None
         self.last_chunks: List[Dict[str, Any]] = []
         self.last_skip_reason: Optional[str] = None
+        self.last_resolved_q: Optional[str] = None
+        self.last_original_q: Optional[str] = None
 
         # Ensure the chunk vector index exists (idempotent).
         try:
@@ -139,12 +141,21 @@ class QueryAgent:
         )
 
         prompt = ChatPromptTemplate.from_template("""
-Rewrite the follow-up question as a fully standalone question, using the
-conversation history to fill in implicit context (pronouns, definite
-articles like "the symptoms", continuations like "on physical level").
+Rewrite the follow-up question to be self-contained, ONLY filling in
+references that are genuinely missing from the question text.
 
-If the question is ALREADY standalone and self-contained, return it
-verbatim with no changes.
+Fill in:
+- Pronouns (it, they, this) → the entity they refer to
+- Definite back-references ("the symptoms" → "the {{topic}}'s symptoms" if topic was named)
+- Sentence fragments that depend on prior context ("on physical level" → expand)
+
+DO NOT:
+- Add topical anchors that aren't in the original question (e.g. don't
+  add "related to LRRK2" just because LRRK2 was the previous topic)
+- Narrow a broad question into a specific one
+- Change the scope of the question
+
+If the question is already self-contained, return it VERBATIM.
 
 Return ONLY the rewritten question. No preamble, no quotes, no commentary.
 
@@ -253,7 +264,14 @@ Cypher Query:
             if old in cypher:
                 cypher = cypher.replace(old, new)
 
-        if "parkinson" in cypher.lower() or "pd" in cypher.lower():
+        # Only trigger the Parkinson's-specific rewrite when 'parkinson' or 'pd'
+        # appears as a quoted CONTAINS argument, not as an incidental substring
+        # (which previously matched things like UPDATED, compound, etc.).
+        pd_in_quotes = re.search(
+            r"CONTAINS\s+['\"](parkinson[^'\"]*|pd)['\"]",
+            cypher, flags=re.IGNORECASE,
+        )
+        if pd_in_quotes:
             cypher = cypher.replace("d.name CONTAINS", "t.name CONTAINS")
             cypher = cypher.replace("d.id CONTAINS", "t.id CONTAINS")
             replacement = ("(toLower(t.name) CONTAINS 'parkinson' OR "
@@ -319,19 +337,43 @@ Corrected Cypher:""")
             return ""
         return self._extract_cypher(raw)
 
+    # Status / enum values that show up in Cypher results but are never
+    # entity names — passing these to the provenance lookup wastes a query
+    # and surfaces spurious "Sources" attributed to whichever paper happened
+    # to mention the same word.
+    _PROVENANCE_NOISE = {
+        "COMPLETED", "RECRUITING", "NOT_YET_RECRUITING", "ACTIVE_NOT_RECRUITING",
+        "TERMINATED", "WITHDRAWN", "UNKNOWN", "SUSPENDED",
+        "APPROVED", "PENDING", "ACTIVE", "INACTIVE",
+        "YES", "NO", "TRUE", "FALSE", "NONE", "NULL",
+    }
+
     def _lookup_provenance(self, results: List[Dict[str, Any]]
                            ) -> List[Dict[str, Any]]:
         """Given Cypher result rows, find which Paper(s) mention the entities
-        that appear in those rows. Used to surface citations during synthesis."""
+        that appear in those rows. Used to surface citations during synthesis.
+
+        Filters out obvious non-entity values (status enums, NCT trial IDs,
+        very short/long strings) to avoid spurious provenance hits."""
         if not results:
             return []
 
-        # Pull all string-ish values out of result rows as candidate entity names.
+        import re as _re
+        nct_pattern = _re.compile(r"^NCT\d+$")
+
         candidates = set()
         for row in results:
             for v in row.values():
-                if isinstance(v, str) and v.strip():
-                    candidates.add(v.strip())
+                if not isinstance(v, str):
+                    continue
+                s = v.strip()
+                if not s or len(s) < 3 or len(s) > 80:
+                    continue
+                if s.upper() in self._PROVENANCE_NOISE:
+                    continue
+                if nct_pattern.match(s):
+                    continue
+                candidates.add(s)
         if not candidates:
             return []
 
@@ -356,12 +398,11 @@ Corrected Cypher:""")
         """Pick a synthesis prompt based on what retrieval surfaced:
         graph rows, vector-retrieved passages, both, or neither.
 
-        All prompts include a {history} variable so the synthesizer can
-        interpret follow-up questions in the context of the conversation.
-        When the passages happen to be from a single paper but the question
-        is broader, the history lets the model recognize the drift and
-        either answer broadly from general knowledge or note the limitation
-        explicitly instead of pretending the passages cover the question."""
+        Chat history is intentionally NOT passed here. Small instruction-tuned
+        models tend to "continue the previous thread" when they see history,
+        even when the current question is genuinely broader. Pronoun
+        resolution upstream is responsible for making each question
+        self-contained; synthesis then answers it fresh."""
         has_results = bool(results)
         has_chunks = bool(chunks)
 
@@ -372,10 +413,7 @@ contained relevant information for this query. You are a helpful medical
 research assistant — answer concisely from general knowledge.
 Start your answer with: "(General Knowledge Fallback)".
 
-Conversation so far:
-{history}
-
-Current question: {question}
+Question: {question}
 """)
         elif has_results and has_chunks:
             prompt = ChatPromptTemplate.from_template("""
@@ -384,14 +422,13 @@ structured database results AND the relevant paper passages below.
 Prefer specifics from the structured results; use the passages for
 context and quotation.
 
-If the passages drift off-topic from the question (e.g. all from one
-paper but the question is broader), say so plainly and supplement with
-general knowledge rather than forcing an answer from the passages.
+⚠️  COVERAGE NOTE: Retrieved passages come from these papers only:
+{source_papers}
+If the question is broader than what these papers cover (e.g. asking
+about a disease generally while passages only discuss one gene), say so
+explicitly and supplement with general knowledge.
 
-Conversation so far:
-{history}
-
-Current question: {question}
+Question: {question}
 
 Structured Results: {results}
 
@@ -400,10 +437,11 @@ Source Papers (entities → papers): {provenance}
 Relevant Passages (semantic match):
 {chunks}
 
-At the end, write a line: "Sources:" followed by the values of the
-`paper` field shown in the passages above (deduplicated, comma-separated).
-DO NOT cite references mentioned inside the passage text itself
-(e.g. "Smith et al. 2023"). Only cite the `paper` field values.
+End your answer with exactly this line (no other format):
+Sources: {source_papers}
+
+Do NOT cite references mentioned inside the passage text itself
+(e.g. "Smith et al. 2023"). Only cite the papers listed above.
 """)
         elif has_chunks:
             prompt = ChatPromptTemplate.from_template("""
@@ -411,32 +449,29 @@ You are answering a question in an ongoing conversation. The structured
 graph returned no direct rows, but the passages below were retrieved
 semantically from the source papers.
 
-If those passages genuinely cover the question, answer grounded in them.
-If they drift off-topic (e.g. all from one paper about a narrower subject
-than the question asks), say so and answer from general knowledge,
-starting with "(General Knowledge — passages did not cover this)".
+⚠️  COVERAGE NOTE: All retrieved passages come from these papers only:
+{source_papers}
+If the question is broader than what these papers cover (e.g. asking
+about Parkinson's symptoms generally while passages only discuss LRRK2),
+START your answer with "(Passages covered limited scope — supplementing
+with general knowledge)" and then answer broadly.
 
-Conversation so far:
-{history}
-
-Current question: {question}
+Question: {question}
 
 Relevant Passages:
 {chunks}
 
-If you used the passages, end with a "Sources:" line listing the values
-of the `paper` field (deduplicated, comma-separated). DO NOT cite
-references mentioned inside the passage text itself.
+If you used any passage content, end your answer with exactly this line:
+Sources: {source_papers}
+
+Do NOT cite references mentioned inside the passage text itself.
 """)
         elif provenance:
             prompt = ChatPromptTemplate.from_template("""
 You are answering a question in an ongoing conversation. Synthesize a
 concise answer based on the database results below.
 
-Conversation so far:
-{history}
-
-Current question: {question}
+Question: {question}
 
 Results: {results}
 
@@ -449,10 +484,7 @@ End with a "Sources:" line listing the contributing papers.
 You are answering a question in an ongoing conversation. Synthesize a
 concise answer based on the database results.
 
-Conversation so far:
-{history}
-
-Current question: {question}
+Question: {question}
 
 Results: {results}
 """)
@@ -465,6 +497,13 @@ Results: {results}
         recent = chat_history[-(HISTORY_TURNS_FOR_SYNTHESIS * 2):]
         return "\n".join(f"{m['role']}: {m['content']}" for m in recent)
 
+    def _unique_papers(self, chunks: List[Dict[str, Any]]) -> str:
+        """Comma-separated, deduplicated list of paper IDs from vector chunks.
+        Avoids the synthesizer parroting "PaperA, PaperA, PaperA" by handing
+        it an already-clean list."""
+        papers = sorted({c.get("paper") for c in chunks if c.get("paper")})
+        return ", ".join(papers) if papers else "(none)"
+
     def _synthesize_answer(self, question: str,
                            results: List[Dict[str, Any]],
                            chunks: List[Dict[str, Any]],
@@ -476,7 +515,7 @@ Results: {results}
             "results": str(results),
             "provenance": str(provenance),
             "chunks": str(chunks),
-            "history": self._format_history(chat_history),
+            "source_papers": self._unique_papers(chunks),
         })
 
     GREETING_REPLY = (
@@ -495,7 +534,9 @@ Results: {results}
         Cypher generation costs ~30s on local Llama 3. If the top vector chunk
         is already a strong semantic match, we skip Cypher and let the passages
         carry the answer. This is the largest single latency win available."""
+        self.last_original_q = question
         resolved_q = self._resolve_pronouns(question, chat_history)
+        self.last_resolved_q = resolved_q
 
         # Vector search runs first because it's cheap (~1s) and tells us
         # whether Cypher is worth the wait.
@@ -550,7 +591,7 @@ Results: {results}
             "results": str(rows),
             "provenance": str(provenance),
             "chunks": str(chunks),
-            "history": self._format_history(chat_history),
+            "source_papers": self._unique_papers(chunks),
         }):
             yield stream_chunk
 

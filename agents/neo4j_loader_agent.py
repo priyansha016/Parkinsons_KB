@@ -1,9 +1,20 @@
 import os
+import re
 from typing import Dict, Any, List, Optional
 from neo4j import GraphDatabase, basic_auth
 
 VECTOR_INDEX_NAME = "chunk_embedding_idx"
 VECTOR_DIM = 768  # nomic-embed-text
+
+# Cypher labels and relationship types are interpolated (Neo4j does not
+# parameterize them), so any backtick or non-identifier character from the
+# LLM-emitted type string could break out of the quoted label. Strip them.
+_IDENT_PATTERN = re.compile(r"[^A-Za-z0-9_]")
+
+
+def _safe_ident(name: str, fallback: str = "Unknown") -> str:
+    cleaned = _IDENT_PATTERN.sub("", name or "")
+    return cleaned if cleaned else fallback
 
 
 def _driver():
@@ -31,7 +42,7 @@ def ensure_vector_index(session) -> None:
 def _merge_node(tx, node: Dict[str, Any]) -> bool:
     if "id" not in node or "type" not in node:
         return False
-    label = f"`{node['type']}`"
+    label = f"`{_safe_ident(node['type'])}`"
     aliases = node.get("aliases") or []
     extra_props = {k: v for k, v in node.items()
                    if k not in ("id", "type", "aliases")}
@@ -56,9 +67,10 @@ def _merge_node(tx, node: Dict[str, Any]) -> bool:
 def _merge_relationship(tx, rel: Dict[str, Any]) -> bool:
     if "source_id" not in rel or "target_id" not in rel or "type" not in rel:
         return False
+    rel_type = _safe_ident(rel["type"], fallback="RELATED_TO")
     tx.run(
         f"MATCH (s {{id: $sid}}), (t {{id: $tid}}) "
-        f"MERGE (s)-[:`{rel['type']}`]->(t)",
+        f"MERGE (s)-[:`{rel_type}`]->(t)",
         sid=rel["source_id"], tid=rel["target_id"],
     )
     return True

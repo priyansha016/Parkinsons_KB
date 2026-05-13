@@ -17,6 +17,7 @@ import os
 import re
 from threading import Lock
 from typing import Optional, Dict, Any, List
+from urllib.parse import quote
 import requests
 
 
@@ -99,8 +100,10 @@ def _lookup_uniprot(name: str) -> Optional[Dict[str, str]]:
 
 def _lookup_hgnc(name: str) -> Optional[Dict[str, str]]:
     try:
+        # The name is spliced into the URL path — URL-encode it so LLM-emitted
+        # characters like /, ?, # or spaces don't break the request.
         r = requests.get(
-            f"https://rest.genenames.org/search/symbol:{name}",
+            f"https://rest.genenames.org/search/symbol:{quote(name, safe='')}",
             headers={"Accept": "application/json"},
             timeout=REQUEST_TIMEOUT,
         )

@@ -6,7 +6,7 @@ from langchain_core.output_parsers import JsonOutputParser
 from langchain_core.documents import Document
 from utils.models import KnowledgeGraphSchema
 
-llm = ChatOllama(model="llama3", temperature=0.0, format="json")
+llm = ChatOllama(model="gemma3:4b", temperature=0.0, format="json")
 parser = JsonOutputParser(pydantic_object=KnowledgeGraphSchema)
 
 SYSTEM_PROMPT = """
