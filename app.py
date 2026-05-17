@@ -65,11 +65,11 @@ else:
 
 # --- Main UI ---
 st.title("🧠 Parkinson's Knowledge Graph")
-st.subheader("Graph RAG with Dynamic Enrichment")
+st.subheader("Hybrid Graph RAG over scientific literature")
 
 st.markdown("""
-Ask anything about Parkinson's research. If the graph doesn't know the answer, 
-it will proactively research via **KEGG, STRING, and ClinicalTrials.gov** APIs!
+Ask anything about Parkinson's research. Answers combine structured graph queries
+with semantic search over paper passages, and cite the source PDF for every claim.
 """)
 
 # Display chat history
