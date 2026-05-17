@@ -531,7 +531,7 @@ Results: {results}
                  ) -> Tuple[str, List[Dict[str, Any]], List[Dict[str, Any]]]:
         """Resolve pronouns, run vector search, then conditionally generate Cypher.
 
-        Cypher generation costs ~30s on local Llama 3. If the top vector chunk
+        Cypher generation costs ~30s on local Gemma 3 4B. If the top vector chunk
         is already a strong semantic match, we skip Cypher and let the passages
         carry the answer. This is the largest single latency win available."""
         self.last_original_q = question

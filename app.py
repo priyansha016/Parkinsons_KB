@@ -138,4 +138,4 @@ if prompt := st.chat_input("What would you like to know?"):
 
 # Footer
 st.divider()
-st.caption("Built with LangChain, Ollama (Llama 3), and Neo4j Desktop.")
+st.caption("Built with LangChain, Ollama (Gemma 3 4B), and Neo4j.")
