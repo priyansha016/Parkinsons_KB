@@ -7,3 +7,4 @@ KG_OREGANO.webp
 .env
 __pycache__/
 processed_files.txt
+docs/diagrams.html
